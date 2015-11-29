@@ -1,0 +1,577 @@
+/*
+  Copyright(c) 2010-2014 Intel Corporation.
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in
+      the documentation and/or other materials provided with the
+      distribution.
+    * Neither the name of Intel Corporation nor the names of its
+      contributors may be used to endorse or promote products derived
+      from this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+commit 17aec69c359b7dc0e408ace8f0873020b5c9f4fe
+Author: Patrice BURIEZ <patrice.buriez@intel.com>
+Date:   Mon Feb 3 18:56:59 2014 +0100
+
+    Extended hash features on top of bug-fixed DPDK 1.3
+    
+    - Allow both key and user data to be managed by hash library
+      - Parallel table not needed anymore
+      - The few bytes per entry, allocated for alignment reason, can now be used
+    - Provide bucket browsing "foreach" macro and functions
+    - New APIs: delete entry and set entry, using position index
+
+diff --git a/lib/librte_hash/rte_hash.c b/lib/librte_hash/rte_hash.c
+index f927f75..5070769 100644
+--- a/lib/librte_hash/rte_hash.c
++++ b/lib/librte_hash/rte_hash.c
+@@ -84,8 +84,8 @@ TAILQ_HEAD(rte_hash_list, rte_hash);
+ /* Signature bucket size is a multiple of this value */
+ #define SIG_BUCKET_ALIGNMENT    16
+ 
+-/* Stoered key size is a multiple of this value */
+-#define KEY_ALIGNMENT           16
++/* Stored entry size (key + data) is a multiple of this value */
++#define ENTRY_ALIGNMENT         16
+ 
+ /* The high bit is always set in real signatures */
+ #define NULL_SIGNATURE          0
+@@ -102,15 +102,15 @@ get_sig_tbl_bucket(const struct rte_hash *h, uint32_t bucket_index)
+ static inline uint8_t *
+ get_key_tbl_bucket(const struct rte_hash *h, uint32_t bucket_index)
+ {
+-	return (uint8_t *) &(h->key_tbl[bucket_index * h->bucket_entries *
+-				     h->key_tbl_key_size]);
++	return (uint8_t *)
++			&(h->key_tbl[bucket_index * h->key_tbl_bucket_size]);
+ }
+ 
+ /* Returns a pointer to a key at a specific position in a specified bucket. */
+ static inline void *
+ get_key_from_bucket(const struct rte_hash *h, uint8_t *bkt, uint32_t pos)
+ {
+-	return (void *) &bkt[pos * h->key_tbl_key_size];
++	return (void *) &bkt[pos * h->key_tbl_entry_size];
+ }
+ 
+ /* Does integer division with rounding-up of result. */
+@@ -166,8 +166,26 @@ rte_hash_find_existing(const char *name)
+ struct rte_hash *
+ rte_hash_create(const struct rte_hash_parameters *params)
+ {
++	struct rte_hash_parameters ext_params;
++
++	/* Extensive checks are later performed by rte_hash_ext_create */
++	if (params == NULL) {
++		rte_errno = EINVAL;
++		RTE_LOG(ERR, HASH, "rte_hash_create has invalid parameters\n");
++		return NULL;
++	}
++
++	/* Backward compatibility */
++	rte_memcpy(&ext_params, params, sizeof(ext_params));
++	ext_params.entry_len = ext_params.key_len;
++	return rte_hash_ext_create(&ext_params);
++}
++
++struct rte_hash *
++rte_hash_ext_create(const struct rte_hash_parameters *params)
++{
+ 	struct rte_hash *h = NULL;
+-	uint32_t num_buckets, sig_bucket_size, key_size, hash_tbl_size;
++	uint32_t num_buckets, sig_bucket_size, entry_size, hash_tbl_size;
+ 	uint64_t sig_tbl_size, key_tbl_size, mem_size;
+ 	char hash_name[RTE_HASH_NAMESIZE];
+ 	struct rte_hash_list *hash_list;
+@@ -187,6 +205,9 @@ rte_hash_create(const struct rte_hash_parameters *params)
+ 			(params->entries < params->bucket_entries) ||
+ 			!rte_is_power_of_2(params->entries) ||
+ 			!rte_is_power_of_2(params->bucket_entries) ||
++			(params->entry_len == 0) ||
++			(params->entry_len > RTE_HASH_ENTRY_LENGTH_MAX) ||
++			(params->entry_len < params->key_len) ||
+ 			(params->key_len == 0) ||
+ 			(params->key_len > RTE_HASH_KEY_LENGTH_MAX)) {
+ 		rte_errno = EINVAL;
+@@ -200,7 +221,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
+ 	num_buckets = params->entries / params->bucket_entries;
+ 	sig_bucket_size = align_size(params->bucket_entries *
+ 				     sizeof(hash_sig_t), SIG_BUCKET_ALIGNMENT);
+-	key_size =  align_size(params->key_len, KEY_ALIGNMENT);
++	entry_size = align_size(params->entry_len, ENTRY_ALIGNMENT);
+ 
+ 	hash_tbl_size = align_size(sizeof(struct rte_hash), CACHE_LINE_SIZE);
+ 
+@@ -213,7 +234,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
+ 	}
+ 	sig_tbl_size = align_size((uint32_t)sig_tbl_size, CACHE_LINE_SIZE);
+ 
+-	key_tbl_size = (uint64_t)params->entries * key_size;
++	key_tbl_size = (uint64_t)params->entries * entry_size;
+ 	if ((key_tbl_size + CACHE_LINE_SIZE - 1) > UINT32_MAX) {
+ 		rte_errno = EINVAL;
+ 		RTE_LOG(ERR, HASH, "rte_hash_create: key_tbl_size overflow\n");
+@@ -250,6 +271,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
+ 	rte_snprintf(h->name, sizeof(h->name), "%s", params->name);
+ 	h->entries = params->entries;
+ 	h->bucket_entries = params->bucket_entries;
++	h->entry_len = params->entry_len;
+ 	h->key_len = params->key_len;
+ 	h->hash_func_init_val = params->hash_func_init_val;
+ 	h->num_buckets = num_buckets;
+@@ -258,7 +280,8 @@ rte_hash_create(const struct rte_hash_parameters *params)
+ 	h->sig_tbl = (uint8_t *)h + hash_tbl_size;
+ 	h->sig_tbl_bucket_size = sig_bucket_size;
+ 	h->key_tbl = h->sig_tbl + (uint32_t)sig_tbl_size;
+-	h->key_tbl_key_size = key_size;
++	h->key_tbl_entry_size = entry_size;
++	h->key_tbl_bucket_size = h->bucket_entries * h->key_tbl_entry_size;
+ 	h->hash_func = (params->hash_func == NULL) ?
+ 		DEFAULT_HASH_FUNC : params->hash_func;
+ 
+@@ -281,44 +304,54 @@ rte_hash_free(struct rte_hash *h)
+ }
+ 
+ int32_t
+-rte_hash_add_key(const struct rte_hash *h, const void *key)
++rte_hash_ext_add_entry(const struct rte_hash *h, const void *entry,
++		struct rte_hash_ext *ext)
+ {
+ 	hash_sig_t sig, *sig_bucket;
+ 	uint8_t *key_bucket;
+ 	uint32_t bucket_index, i;
+ 	int32_t pos;
++	void *bucket_entry;
+ 
+-	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
++	RETURN_IF_TRUE(((h == NULL) || (entry == NULL) || (ext == NULL)), -EINVAL);
+ 
+ 	/* Get the hash signature and bucket index */
+-	sig = h->hash_func(key, h->key_len, h->hash_func_init_val) | h->sig_msb;
++	ext->sig =
++	sig = h->hash_func(entry, h->key_len, h->hash_func_init_val) | h->sig_msb;
+ 	bucket_index = sig & h->bucket_bitmask;
++	ext->sig_bucket =
+ 	sig_bucket = get_sig_tbl_bucket(h, bucket_index);
++	ext->key_bucket =
+ 	key_bucket = get_key_tbl_bucket(h, bucket_index);
+ 
+-	/* Check if key is already present in the hash */
++	/* Check if entry is already present in the hash */
+ 	for (i = 0; i < h->bucket_entries; i++) {
+ 		if ((sig == sig_bucket[i]) &&
+-		    likely(memcmp(key, get_key_from_bucket(h, key_bucket, i),
++		    likely(memcmp(entry, bucket_entry =
++					 get_key_from_bucket(h, key_bucket, i),
+ 				  h->key_len) == 0)) {
++			ext->bucket_entry = bucket_entry;
+ 			return bucket_index * h->bucket_entries + i;
+ 		}
+ 	}
+ 
+-	/* Check if any free slot within the bucket to add the new key */
++	/* Check if any free slot within the bucket to add the new entry */
+ 	pos = find_first(NULL_SIGNATURE, sig_bucket, h->bucket_entries);
+ 
+-	if (unlikely(pos < 0))
++	if (unlikely(pos < 0)) {
++		ext->bucket_entry = NULL;
+ 		return -ENOSPC;
++	}
+ 
+-	/* Add the new key to the bucket */
++	/* Add the new entry to the bucket */
+ 	sig_bucket[pos] = sig;
+-	rte_memcpy(get_key_from_bucket(h, key_bucket, pos), key, h->key_len);
++	rte_memcpy(ext->bucket_entry =
++		   get_key_from_bucket(h, key_bucket, pos), entry, h->entry_len);
+ 	return bucket_index * h->bucket_entries + pos;
+ }
+ 
+ int32_t
+-rte_hash_del_key(const struct rte_hash *h, const void *key)
++rte_hash_del_entry(const struct rte_hash *h, const void *key)
+ {
+ 	hash_sig_t sig, *sig_bucket;
+ 	uint8_t *key_bucket;
+@@ -332,7 +365,7 @@ rte_hash_del_key(const struct rte_hash *h, const void *key)
+ 	sig_bucket = get_sig_tbl_bucket(h, bucket_index);
+ 	key_bucket = get_key_tbl_bucket(h, bucket_index);
+ 
+-	/* Check if key is already present in the hash */
++	/* Check if entry is already present in the hash */
+ 	for (i = 0; i < h->bucket_entries; i++) {
+ 		if ((sig == sig_bucket[i]) &&
+ 		    likely(memcmp(key, get_key_from_bucket(h, key_bucket, i),
+@@ -346,29 +379,73 @@ rte_hash_del_key(const struct rte_hash *h, const void *key)
+ }
+ 
+ int32_t
+-rte_hash_lookup(const struct rte_hash *h, const void *key)
++rte_hash_ext_del_entry(const struct rte_hash *h,
++		const struct rte_hash_ext *ext, int32_t position)
++{
++	uint32_t entry_index;
++
++	RETURN_IF_TRUE(((h == NULL) || (ext == NULL) || (position < 0) ||
++			((uint32_t)position >= h->entries)), -EINVAL);
++
++	/* bucket_entries is power of 2, modulo can be computed using bitwise AND */
++	entry_index = (uint32_t)position & (h->bucket_entries - 1);
++
++	/* Mark entry as removed */
++	ext->sig_bucket[entry_index] = NULL_SIGNATURE;
++	return position;
++}
++
++int32_t
++rte_hash_ext_set_entry(const struct rte_hash *h, const void *entry,
++		const struct rte_hash_ext *ext, int32_t position)
++{
++	uint32_t entry_index;
++
++	RETURN_IF_TRUE(((h == NULL) || (entry == NULL) || (ext == NULL) ||
++			(position < 0) || ((uint32_t)position >= h->entries)),
++			-EINVAL);
++
++	/* bucket_entries is power of 2, modulo can be computed using bitwise AND */
++	entry_index = (uint32_t)position & (h->bucket_entries - 1);
++
++	/* Set the entry to the bucket */
++	ext->sig_bucket[entry_index] = ext->sig;
++	rte_memcpy(ext->bucket_entry, entry, h->entry_len);
++	return position;
++}
++
++int32_t
++rte_hash_ext_lookup(const struct rte_hash *h, const void *key,
++		struct rte_hash_ext *ext)
+ {
+ 	hash_sig_t sig, *sig_bucket;
+ 	uint8_t *key_bucket;
+ 	uint32_t bucket_index, i;
++	void *bucket_entry;
+ 
+-	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
++	RETURN_IF_TRUE(((h == NULL) || (key == NULL) || (ext == NULL)), -EINVAL);
+ 
+ 	/* Get the hash signature and bucket index */
++	ext->sig =
+ 	sig = h->hash_func(key, h->key_len, h->hash_func_init_val) | h->sig_msb;
+ 	bucket_index = sig & h->bucket_bitmask;
++	ext->sig_bucket =
+ 	sig_bucket = get_sig_tbl_bucket(h, bucket_index);
++	ext->key_bucket =
+ 	key_bucket = get_key_tbl_bucket(h, bucket_index);
+ 
+-	/* Check if key is already present in the hash */
++	/* Check if entry is already present in the hash */
+ 	for (i = 0; i < h->bucket_entries; i++) {
+ 		if ((sig == sig_bucket[i]) &&
+-		    likely(memcmp(key, get_key_from_bucket(h, key_bucket, i),
++		    likely(memcmp(key, bucket_entry =
++				       get_key_from_bucket(h, key_bucket, i),
+ 				  h->key_len) == 0)) {
++			ext->bucket_entry = bucket_entry;
+ 			return bucket_index * h->bucket_entries + i;
+ 		}
+ 	}
+ 
++	ext->bucket_entry = NULL;
+ 	return -ENOENT;
+ }
+ 
+@@ -394,7 +471,7 @@ rte_hash_lookup_multi(const struct rte_hash *h, const void **keys,
+ 		rte_prefetch1((void *) get_key_tbl_bucket(h, bucket_index));
+ 	}
+ 
+-	/* Check if key is already present in the hash */
++	/* Check if entry is already present in the hash */
+ 	for (i = 0; i < num_keys; i++) {
+ 		bucket_index = sigs[i] & h->bucket_bitmask;
+ 		hash_sig_t *sig_bucket = get_sig_tbl_bucket(h, bucket_index);
+diff --git a/lib/librte_hash/rte_hash.h b/lib/librte_hash/rte_hash.h
+index ec7d442..747631b 100644
+--- a/lib/librte_hash/rte_hash.h
++++ b/lib/librte_hash/rte_hash.h
+@@ -42,8 +42,12 @@
+  */
+ 
+ #include <stdint.h>
++#include <errno.h>
++#include <stddef.h>
+ #include <sys/queue.h>
+ 
++#include <rte_branch_prediction.h>
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -57,7 +61,10 @@ extern "C" {
+ /** Maximum length of key that can be used. */
+ #define RTE_HASH_KEY_LENGTH_MAX			64
+ 
+-/** Max number of keys that can be searched for using rte_hash_lookup_multi. */
++/** Maximum length of entry (arbitrary limit) that can be stored. */
++#define RTE_HASH_ENTRY_LENGTH_MAX		4096
++
++/** Max number of entries that can be searched for using rte_hash_lookup_multi. */
+ #define RTE_HASH_LOOKUP_MULTI_MAX		16
+ 
+ /** Max number of characters in hash name.*/
+@@ -78,6 +85,7 @@ struct rte_hash_parameters {
+ 	const char *name;		/**< Name of the hash. */
+ 	uint32_t entries;		/**< Total hash table entries. */
+ 	uint32_t bucket_entries;	/**< Bucket entries. */
++	uint32_t entry_len;		/**< Length of user entry (key + data) */
+ 	uint32_t key_len;		/**< Length of hash key. */
+ 	rte_hash_function hash_func;	/**< Function used to calculate hash. */
+ 	uint32_t hash_func_init_val;	/**< Init value used by hash_func. */
+@@ -91,6 +99,7 @@ struct rte_hash {
+ 	char name[RTE_HASH_NAMESIZE];	/**< Name of the hash. */
+ 	uint32_t entries;		/**< Total table entries. */
+ 	uint32_t bucket_entries;	/**< Bucket entries. */
++	uint32_t entry_len;		/**< Length of user entry (key + data) */
+ 	uint32_t key_len;		/**< Length of hash key. */
+ 	rte_hash_function hash_func;	/**< Function used to calculate hash. */
+ 	uint32_t hash_func_init_val;	/**< Init value used by hash_func. */
+@@ -103,9 +112,20 @@ struct rte_hash {
+ 					   alignment reasons, and this is the
+ 					   bucket size used by sig_tbl. */
+ 	uint8_t *key_tbl;	/**< Flat array of key value buckets. */
+-	uint32_t key_tbl_key_size;	/**< Keys may be padded for alignment
+-					   reasons, and this is the key size
++	uint32_t key_tbl_entry_size;	/**< Entries may be padded for alignment
++					   reasons, and this is the entry size
+ 					   used	by key_tbl. */
++	uint32_t key_tbl_bucket_size;	/**< Pre-computed key bucket size */
++};
++#define key_tbl_key_size key_tbl_entry_size	/* Backward compatibility */
++
++/** A structure providing extended hash features. */
++struct rte_hash_ext {
++	void *bucket_entry;
++	uint8_t *key_bucket;
++	hash_sig_t *sig_bucket;
++	hash_sig_t sig;
++	uint32_t i;
+ };
+ 
+ /**
+@@ -129,6 +149,9 @@ struct rte_hash {
+ struct rte_hash *
+ rte_hash_create(const struct rte_hash_parameters *params);
+ 
++/** Extended variant of rte_hash_create, that handles entry_len. */
++struct rte_hash *
++rte_hash_ext_create(const struct rte_hash_parameters *params);
+ 
+ /**
+  * Find an existing hash table object and return a pointer to it.
+@@ -152,59 +175,77 @@ void
+ rte_hash_free(struct rte_hash *h);
+ 
+ /**
+- * Add a key to an existing hash table. This operation is not multi-thread safe
++ * Add an entry to an existing hash table. This operation is not multi-thread safe
+  * and should only be called from one thread.
+  *
+  * @param h
+- *   Hash table to add the key to.
+- * @param key
+- *   Key to add to the hash table.
++ *   Hash table to add the entry to.
++ * @param entry
++ *   Entry (key + data) to add to the hash table.
+  * @return
+  *   - -EINVAL if the parameters are invalid.
+- *   - -ENOSPC if there is no space in the hash for this key.
++ *   - -ENOSPC if there is no space in the hash for this entry.
+  *   - A positive value that can be used by the caller as an offset into an
+- *     array of user data. This value is unique for this key.
++ *     array of user data. This value is unique for the key part of this entry.
+  */
+ int32_t
+-rte_hash_add_key(const struct rte_hash *h, const void *key);
++rte_hash_ext_add_entry(const struct rte_hash *h, const void *entry,
++		struct rte_hash_ext *ext);
++
++static inline int32_t
++rte_hash_add_entry(const struct rte_hash *h, const void *entry)
++{
++	struct rte_hash_ext ext;
++	return rte_hash_ext_add_entry(h, entry, &ext);
++}
++#define rte_hash_add_key rte_hash_add_entry	/* Backward compatibility */
+ 
+ /**
+- * Remove a key from an existing hash table. This operation is not multi-thread
++ * Remove an entry from an existing hash table. This operation is not multi-thread
+  * safe and should only be called from one thread.
+  *
+  * @param h
+- *   Hash table to remove the key from.
++ *   Hash table to remove the entry from.
+  * @param key
+- *   Key to remove from the hash table.
++ *   Key part of the entry to remove from the hash table.
+  * @return
+  *   - -EINVAL if the parameters are invalid.
+  *   - -ENOENT if the key is not found.
+  *   - A positive value that can be used by the caller as an offset into an
+  *     array of user data. This value is unique for this key, and is the same
+- *     value that was returned when the key was added.
++ *     value that was returned when the entry was added.
+  */
+ int32_t
+-rte_hash_del_key(const struct rte_hash *h, const void *key);
++rte_hash_del_entry(const struct rte_hash *h, const void *key);
++#define rte_hash_del_key rte_hash_del_entry	/* Backward compatibility */
+ 
+ /**
+- * Find a key in the hash table. This operation is multi-thread safe.
++ * Find an entry in the hash table. This operation is multi-thread safe.
+  *
+  * @param h
+  *   Hash table to look in.
+  * @param key
+- *   Key to find.
++ *   Key part of the entry to find.
+  * @return
+  *   - -EINVAL if the parameters are invalid.
+  *   - -ENOENT if the key is not found.
+  *   - A positive value that can be used by the caller as an offset into an
+  *     array of user data. This value is unique for this key, and is the same
+- *     value that was returned when the key was added.
++ *     value that was returned when the entry was added.
+  */
+ int32_t
+-rte_hash_lookup(const struct rte_hash *h, const void *key);
++rte_hash_ext_lookup(const struct rte_hash *h, const void *key,
++		struct rte_hash_ext *ext);
++
++static inline int32_t
++rte_hash_lookup(const struct rte_hash *h, const void *key)
++{
++	struct rte_hash_ext ext;
++	return rte_hash_ext_lookup(h, key, &ext);
++}
+ 
+ /**
+- * Find multiple keys in the hash table. This operation is multi-thread safe.
++ * Find multiple entries in the hash table. This operation is multi-thread safe.
+  *
+  * @param h
+  *   Hash table to look in.
+@@ -216,7 +257,7 @@ rte_hash_lookup(const struct rte_hash *h, const void *key);
+  *   Output containing a list of values, corresponding to the list of keys that
+  *   can be used by the caller as an offset into an array of user data. These
+  *   values are unique for each key, and are the same values that were returned
+- *   when each key was added. If a key in the list was not found, then -ENOENT
++ *   when each entry was added. If a key in the list was not found, then -ENOENT
+  *   will be the value.
+  * @return
+  *   -EINVAL if there's an error, otherwise 0.
+@@ -225,6 +266,82 @@ int
+ rte_hash_lookup_multi(const struct rte_hash *h, const void **keys,
+ 		      uint32_t num_keys, int32_t *positions);
+ 
++/**
++ * Extended features.
++ */
++
++/** Delete entry at specific position. */
++int32_t
++rte_hash_ext_del_entry(const struct rte_hash *h,
++		const struct rte_hash_ext *ext, int32_t position);
++
++/** Set entry at specific position. */
++int32_t
++rte_hash_ext_set_entry(const struct rte_hash *h, const void *entry,
++		const struct rte_hash_ext *ext, int32_t position);
++
++/**
++ * Functions and macro to browse all _used_ entries of the bucket where
++ * the previously looked up or added entry would fit. Works even when
++ * lookup or add_entry failed, except on EINVAL failure (bad parameters).
++ */
++static inline int32_t
++_rte_hash_ext_get_first_bucket_position(const struct rte_hash *h,
++		struct rte_hash_ext *ext)
++{
++#if defined(RTE_LIBRTE_HASH_DEBUG)
++	/* Validity checks only performed on loop entry */
++	if (unlikely((uint8_t *)ext->sig_bucket < h->sig_tbl))
++		return -EINVAL;
++	if (unlikely((uint8_t *)ext->sig_bucket >= h->key_tbl))
++		return -EINVAL;
++	if (unlikely((((uint8_t *)ext->sig_bucket - h->sig_tbl) % h->sig_tbl_bucket_size) != 0))
++		return -EINVAL;
++	if (unlikely(ext->key_bucket < h->key_tbl))
++		return -EINVAL;
++	if (unlikely(ext->key_bucket >= h->key_tbl + h->entries * h->key_tbl_entry_size))
++		return -EINVAL;
++	if (unlikely(((ext->key_bucket - h->key_tbl) % h->key_tbl_bucket_size) != 0))
++		return -EINVAL;
++#endif
++
++	/* Start from first bucket entry */
++	for (ext->i = 0; likely(ext->i < h->bucket_entries); ++ext->i) {
++		/* Browsing will probably be performed on a full bucket */
++		if (likely(ext->sig_bucket[ext->i] != 0)) {
++			ext->bucket_entry = ext->key_bucket
++				+ ext->i * h->key_tbl_entry_size;
++			return (ext->sig & h->bucket_bitmask) * h->bucket_entries
++				+ ext->i;
++		}
++	}
++	ext->bucket_entry = NULL;
++	return -ENOENT;
++}
++
++static inline int32_t
++_rte_hash_ext_get_next_bucket_position(const struct rte_hash *h,
++		struct rte_hash_ext *ext)
++{
++	/* Start from next bucket entry */
++	for (++ext->i; likely(ext->i < h->bucket_entries); ++ext->i) {
++		/* Browsing will probably be performed on a full bucket */
++		if (likely(ext->sig_bucket[ext->i] != 0)) {
++			ext->bucket_entry = ext->key_bucket
++				+ ext->i * h->key_tbl_entry_size;
++			return (ext->sig & h->bucket_bitmask) * h->bucket_entries
++				+ ext->i;
++		}
++	}
++	ext->bucket_entry = NULL;
++	return -ENOENT;
++}
++
++#define RTE_HASH_FOREACH_BUCKET_POSITION(pos, h, ext)			\
++	for (pos = _rte_hash_ext_get_first_bucket_position(h, ext);	\
++	     likely(pos >= 0);						\
++	     pos = _rte_hash_ext_get_next_bucket_position(h, ext))
++
+ #ifdef __cplusplus
+ }
+ #endif
